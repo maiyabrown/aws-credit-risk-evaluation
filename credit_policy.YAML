@@ -1,0 +1,52 @@
+# policy/credit_policy.yaml
+version: "1.0.0"
+metadata:
+  owner: Credit Risk
+  description: Baseline client risk health policy
+
+thresholds:
+  interest_coverage_min: 2.0        # x
+  dscr_min: 1.25                    # x
+  net_leverage_max: 3.5             # x
+
+rules:
+  - id: R1
+    name: "Interest coverage minimum"
+    when: "features.interest_coverage is not None"
+    condition: "features.interest_coverage >= thresholds.interest_coverage_min"
+    pass: "Interest coverage {{features.interest_coverage}}x ≥ {{thresholds.interest_coverage_min}}x"
+    fail: "Interest coverage {{features.interest_coverage}}x < {{thresholds.interest_coverage_min}}x"
+    weight: 0.35
+
+  - id: R2
+    name: "DSCR minimum"
+    when: "features.dscr is not None"
+    condition: "features.dscr >= thresholds.dscr_min"
+    pass: "DSCR {{features.dscr}}x ≥ {{thresholds.dscr_min}}x"
+    fail: "DSCR {{features.dscr}}x < {{thresholds.dscr_min}}x"
+    weight: 0.35
+
+  - id: R3
+    name: "Net leverage cap"
+    when: "features.net_leverage is not None"
+    condition: "features.net_leverage <= thresholds.net_leverage_max"
+    pass: "Net leverage {{features.net_leverage}}x ≤ {{thresholds.net_leverage_max}}x"
+    fail: "Net leverage {{features.net_leverage}}x > {{thresholds.net_leverage_max}}x"
+    weight: 0.20
+
+  - id: R4
+    name: "No covenant breaches"
+    # populated from AI covenant extraction
+    condition: "features.covenant_breach_count == 0"
+    pass: "No covenant breaches found"
+    fail: "{{features.covenant_breach_count}} covenant breach(es) detected"
+    weight: 0.10
+    hard_fail: true   # any breach flips overall to UNHEALTHY
+
+aggregation:
+  # If any hard_fail rule fails => UNHEALTHY, else compute weighted score
+  healthy_threshold: 0.70
+  labels:
+    healthy: "HEALTHY"
+    review: "REVIEW"
+    unhealthy: "UNHEALTHY"

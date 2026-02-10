@@ -1,0 +1,28 @@
+# Core ML/AI dependencies
+transformers>=4.43
+accelerate
+torch>=2.0.0
+
+# Data processing
+pydantic
+pandas
+openpyxl
+pypdf2
+pyyaml
+jinja2
+
+# Vision models (optional)
+qwen-vl-utils
+pillow
+pdf2image
+
+# NLP dependencies
+tiktoken
+sentencepiece
+
+# AWS dependencies
+boto3>=1.26.0
+botocore>=1.29.0
+
+# Additional utilities
+python-dotenv
