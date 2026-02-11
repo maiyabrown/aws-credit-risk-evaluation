@@ -1,7 +1,7 @@
-# risk_pipeline_sagemaker.py
+# risk_pipeline_sagemaker_endpoint.py
 """
-AWS SageMaker compatible credit risk pipeline with S3 integration.
-Reads PDFs and Excel files from S3, processes them, and writes outputs back to S3.
+AWS SageMaker pipeline that uses a deployed endpoint for LLM inference.
+This version calls a SageMaker real-time endpoint instead of loading models locally.
 """
 from __future__ import annotations
 import os, sys, json, argparse, tempfile
@@ -16,13 +16,18 @@ from jinja2 import Template
 import boto3
 from botocore.exceptions import ClientError
 
-from ai_assist_risk import (
-    HFJsonClientConfig, HFJsonClient,
-    extract_interest_coverage_from_text,
-    extract_covenants_and_breaches,
-    run_discrepancy_check,
+# Import endpoint-based clients
+from ai_assist_risk_endpoint import (
+    SageMakerEndpointConfig,
+    SageMakerEndpointClient,
+    extract_interest_coverage_from_text_endpoint,
+    extract_covenants_and_breaches_endpoint,
+    run_discrepancy_check_endpoint,
     gate_for_review,
-    NumericEvidence, CovenantExtraction, DiscrepancyReport,
+)
+
+# Import offline functions for fallback
+from ai_assist_risk import (
     offline_extract_interest_coverage,
     offline_extract_covenants,
     offline_discrepancy_check,
@@ -88,16 +93,6 @@ class S3Handler:
             logger.error(f"Failed to download {s3_key}: {e}")
             raise
     
-    def upload_file(self, local_path: Path, s3_key: str) -> None:
-        """Upload a local file to S3."""
-        try:
-            logger.info(f"Uploading {local_path} to s3://{self.bucket_name}/{s3_key}")
-            self.s3_client.upload_file(str(local_path), self.bucket_name, s3_key)
-            logger.info(f"Successfully uploaded to {s3_key}")
-        except ClientError as e:
-            logger.error(f"Failed to upload to {s3_key}: {e}")
-            raise
-    
     def upload_string(self, content: str, s3_key: str, content_type: str = 'text/plain') -> None:
         """Upload string content directly to S3."""
         try:
@@ -112,28 +107,6 @@ class S3Handler:
         except ClientError as e:
             logger.error(f"Failed to upload content to {s3_key}: {e}")
             raise
-    
-    def list_files(self, prefix: str = '') -> List[str]:
-        """List all files in the bucket with given prefix."""
-        try:
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.bucket_name,
-                Prefix=prefix
-            )
-            if 'Contents' in response:
-                return [obj['Key'] for obj in response['Contents']]
-            return []
-        except ClientError as e:
-            logger.error(f"Failed to list files with prefix {prefix}: {e}")
-            raise
-    
-    def file_exists(self, s3_key: str) -> bool:
-        """Check if a file exists in S3."""
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except ClientError:
-            return False
 
 
 class AttrDict(dict):
@@ -150,11 +123,6 @@ class AttrDict(dict):
 def safe_eval(expr: str, env: Dict[str, Any]) -> bool:
     """Safely evaluate a boolean expression."""
     return bool(eval(expr, {"__builtins__": {}}, env))
-
-
-def render_text(tmpl: str, env: Dict[str, Any]) -> str:
-    """Render a Jinja2 template with given environment."""
-    return Template(tmpl).render(**env)
 
 
 def read_policy(path: Path) -> Dict[str, Any]:
@@ -176,7 +144,7 @@ def load_pdf_texts(pdf_path: Path) -> List[str]:
 
 
 def load_excel_metrics(excel_path: Path) -> Dict[str, float]:
-    """Load metrics from Excel file with 'Metrics' sheet containing Metric and Value columns."""
+    """Load metrics from Excel file."""
     df = pd.read_excel(excel_path, sheet_name='Metrics', engine='openpyxl')
     df = df.dropna()
     metrics = {}
@@ -259,14 +227,22 @@ def process_risk_assessment(
     excel_s3_key: Optional[str],
     policy_s3_key: str,
     output_prefix: str,
-    text_llm: str,
+    endpoint_name: Optional[str] = None,
+    region: Optional[str] = None,
     offline: bool = False
 ) -> Dict[str, Any]:
     """
-    Main processing function that:
-    1. Downloads files from S3
-    2. Processes them
-    3. Uploads results back to S3
+    Main processing function that uses SageMaker endpoint for inference.
+    
+    Args:
+        s3_handler: S3 handler instance
+        pdf_s3_key: S3 key for PDF
+        excel_s3_key: S3 key for Excel (optional)
+        policy_s3_key: S3 key for policy
+        output_prefix: S3 prefix for outputs
+        endpoint_name: SageMaker endpoint name (required if not offline)
+        region: AWS region
+        offline: Use offline regex mode
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -284,13 +260,13 @@ def process_risk_assessment(
             excel_local = tmp_path / "metrics.xlsx"
             s3_handler.download_file(excel_s3_key, excel_local)
         
-        # Load policy and extract text from PDF
+        # Load policy and extract text
         logger.info("Loading policy and extracting PDF text...")
         policy = read_policy(policy_local)
         page_texts = load_pdf_texts(pdf_local)
         doc_text = "\n\n".join(page_texts)[:180000]
         
-        # Process based on offline mode
+        # Process based on mode
         if offline:
             logger.info("Running in OFFLINE mode (regex-based extraction)")
             ic = offline_extract_interest_coverage(doc_text, pages=page_texts)
@@ -311,12 +287,22 @@ def process_risk_assessment(
             disc = offline_discrepancy_check(features, doc_text, critical=["dscr"])
             
         else:
-            logger.info("Running in ONLINE mode (LLM-based extraction)")
-            llm_cfg = HFJsonClientConfig(model_path=text_llm, temperature=0.0)
-            client = HFJsonClient(llm_cfg)
+            # Use SageMaker endpoint
+            if not endpoint_name:
+                raise ValueError("endpoint_name is required when not in offline mode")
             
-            ic = extract_interest_coverage_from_text(client, doc_text, unit_hint='x', pages=page_texts)
-            cov = extract_covenants_and_breaches(client, doc_text)
+            logger.info(f"Running in ENDPOINT mode using: {endpoint_name}")
+            endpoint_cfg = SageMakerEndpointConfig(
+                endpoint_name=endpoint_name,
+                region_name=region,
+                temperature=0.0
+            )
+            client = SageMakerEndpointClient(endpoint_cfg)
+            
+            ic = extract_interest_coverage_from_text_endpoint(
+                client, doc_text, unit_hint='x', pages=page_texts
+            )
+            cov = extract_covenants_and_breaches_endpoint(client, doc_text)
             
             features: Dict[str, Any] = {
                 "interest_coverage": ic.value,
@@ -330,7 +316,7 @@ def process_risk_assessment(
                 features["dscr"] = metrics.get("DSCR", features["dscr"])
                 features["net_leverage"] = metrics.get("NetLeverage", features["net_leverage"])
             
-            disc = run_discrepancy_check(client, features, doc_text, critical=["dscr"])
+            disc = run_discrepancy_check_endpoint(client, features, doc_text, critical=["dscr"])
         
         # Evaluate rules
         logger.info("Evaluating policy rules...")
@@ -342,11 +328,13 @@ def process_risk_assessment(
             decision['label'] = 'REVIEW'
             logger.info("Low confidence detected - routing to REVIEW")
         
-        # Prepare output JSON
+        # Prepare output
         result = {
             'policy_version': policy.get('version', 'na'),
             'pdf_s3_key': pdf_s3_key,
             'excel_s3_key': excel_s3_key,
+            'endpoint_name': endpoint_name if not offline else None,
+            'mode': 'offline' if offline else 'endpoint',
             'features': features,
             'decision': decision,
             'ai': {
@@ -356,7 +344,7 @@ def process_risk_assessment(
             },
         }
         
-        # Upload JSON result
+        # Upload results
         logger.info("Uploading results to S3...")
         json_key = f"{output_prefix}/decision.json"
         s3_handler.upload_string(
@@ -365,7 +353,7 @@ def process_risk_assessment(
             content_type='application/json'
         )
         
-        # Generate and upload HTML report
+        # Generate and upload HTML
         tpl = Template(HTML_TEMPLATE)
         html = tpl.render(
             label=decision['label'],
@@ -392,58 +380,52 @@ def process_risk_assessment(
 
 
 def main():
-    """Main entry point for command-line execution."""
+    """Main entry point."""
     ap = argparse.ArgumentParser(
-        description="Credit Risk Agent for AWS SageMaker with S3 integration"
+        description="Credit Risk Agent using SageMaker Endpoint"
     )
     
     # S3 configuration
-    ap.add_argument('--bucket', default='credit-risk-usecase-bucket', 
-                    help='S3 bucket name')
-    ap.add_argument('--region', default=None, 
-                    help='AWS region (optional, uses default if not specified)')
+    ap.add_argument('--bucket', default='credit-risk-usecase-bucket')
+    ap.add_argument('--region', default=None)
     
-    # Input file S3 keys
-    ap.add_argument('--pdf-key', required=True, 
-                    help='S3 key for PDF file (e.g., input/document.pdf)')
-    ap.add_argument('--excel-key', default=None, 
-                    help='S3 key for Excel file with Metrics sheet (optional)')
-    ap.add_argument('--policy-key', default='config/credit_policy.yaml', 
-                    help='S3 key for policy YAML file')
+    # Input files
+    ap.add_argument('--pdf-key', required=True)
+    ap.add_argument('--excel-key', default=None)
+    ap.add_argument('--policy-key', default='config/credit_policy.yaml')
     
-    # Output configuration
-    ap.add_argument('--output-prefix', default='output', 
-                    help='S3 prefix for output files')
+    # Output
+    ap.add_argument('--output-prefix', default='output')
     
-    # Model configuration
-    ap.add_argument('--text-llm', default='AdaptLLM/finance-LLM',
-                    help='HuggingFace model path for text LLM')
-    ap.add_argument("--offline", action="store_true", 
-                    help="Run with local regex-based extractors (no HF downloads)")
+    # Endpoint configuration
+    ap.add_argument('--endpoint-name', default='finance-llm-endpoint',
+                    help='SageMaker endpoint name')
+    ap.add_argument("--offline", action="store_true",
+                    help="Use offline regex mode (no endpoint)")
     
     args = ap.parse_args()
     
     try:
-        # Initialize S3 handler
         s3_handler = S3Handler(args.bucket, args.region)
         
-        # Process the risk assessment
         result = process_risk_assessment(
             s3_handler=s3_handler,
             pdf_s3_key=args.pdf_key,
             excel_s3_key=args.excel_key,
             policy_s3_key=args.policy_key,
             output_prefix=args.output_prefix,
-            text_llm=args.text_llm,
+            endpoint_name=args.endpoint_name,
+            region=args.region,
             offline=args.offline
         )
         
         print(f"\n{'='*60}")
         print(f"Risk Assessment Complete")
         print(f"{'='*60}")
+        print(f"Mode: {result['result']['mode']}")
         print(f"Decision: {result['decision_label']}")
         print(f"Score: {result['decision_score']}")
-        print(f"\nResults available at:")
+        print(f"\nResults:")
         print(f"  JSON: s3://{args.bucket}/{result['json_s3_key']}")
         print(f"  HTML: s3://{args.bucket}/{result['html_s3_key']}")
         print(f"{'='*60}\n")

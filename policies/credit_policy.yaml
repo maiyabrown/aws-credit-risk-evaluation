@@ -1,0 +1,49 @@
+version: "1.0.0"
+
+# Policy thresholds
+thresholds:
+  interest_coverage_min: 2.0
+  dscr_min: 1.25
+  net_leverage_max: 3.5
+
+# Evaluation rules
+rules:
+  - id: R1
+    name: "Interest Coverage Minimum"
+    when: "features['interest_coverage'] is not None"
+    condition: "features['interest_coverage'] >= thresholds['interest_coverage_min']"
+    pass: "Interest coverage {{features['interest_coverage']}}x >= {{thresholds['interest_coverage_min']}}x"
+    fail: "Interest coverage {{features['interest_coverage']}}x < {{thresholds['interest_coverage_min']}}x (FAIL)"
+    weight: 0.35
+    hard_fail: false
+
+  - id: R2
+    name: "DSCR Minimum"
+    when: "features['dscr'] is not None"
+    condition: "features['dscr'] >= thresholds['dscr_min']"
+    pass: "DSCR {{features['dscr']}}x >= {{thresholds['dscr_min']}}x"
+    fail: "DSCR {{features['dscr']}}x < {{thresholds['dscr_min']}}x (FAIL)"
+    weight: 0.35
+    hard_fail: false
+
+  - id: R3
+    name: "Net Leverage Maximum"
+    when: "features['net_leverage'] is not None"
+    condition: "features['net_leverage'] <= thresholds['net_leverage_max']"
+    pass: "Net leverage {{features['net_leverage']}}x <= {{thresholds['net_leverage_max']}}x"
+    fail: "Net leverage {{features['net_leverage']}}x > {{thresholds['net_leverage_max']}}x (FAIL)"
+    weight: 0.20
+    hard_fail: false
+
+  - id: R4
+    name: "No Covenant Breaches"
+    condition: "features['covenant_breach_count'] == 0"
+    pass: "No covenant breaches detected"
+    fail: "{{features['covenant_breach_count']}} covenant breach(es) detected (CRITICAL FAIL)"
+    weight: 0.10
+    hard_fail: true
+
+# Aggregation settings
+aggregation:
+  healthy_threshold: 0.70
+  review_threshold: 0.60
